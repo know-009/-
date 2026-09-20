@@ -1,0 +1,140 @@
+name: Stock Alert System Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  system-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Seoul
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check required secrets
+        id: secrets_check
+        shell: bash
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "TELEGRAM_BOT_TOKEN이 없습니다."; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo "TELEGRAM_CHAT_ID가 없습니다."; exit 1; }
+          test -n "$KIS_APP_KEY" || { echo "KIS_APP_KEY가 없습니다."; exit 1; }
+          test -n "$KIS_APP_SECRET" || { echo "KIS_APP_SECRET이 없습니다."; exit 1; }
+
+      - name: Install dependencies
+        id: dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run unit tests
+        id: unit_tests
+        run: pytest -q
+
+      - name: Test KIS authentication, quote and ranking APIs
+        id: kis_test
+        run: |
+          python - <<'PY'
+          import os
+
+          from kis_client import KISClient
+
+          client = KISClient()
+          quote = client.quote("005930")
+          price = int(str(quote.get("stck_prpr", "0")).replace(",", "") or 0)
+          if price <= 0:
+              raise RuntimeError(f"삼성전자 시세 조회 실패: {quote}")
+          print(f"KIS 인증·시세 조회 성공: 삼성전자 {price:,}원")
+
+          checks = (
+              ("KOSPI 거래량", client.volume_rank, "0001"),
+              ("KOSPI 등락률", client.fluctuation_rank, "0001"),
+              ("KOSPI 체결강도", client.volume_power_rank, "0001"),
+              ("KOSPI 외국인·기관", client.foreign_institution_rank, "0001"),
+              ("KOSDAQ 거래량", client.volume_rank, "1001"),
+              ("KOSDAQ 등락률", client.fluctuation_rank, "1001"),
+              ("KOSDAQ 체결강도", client.volume_power_rank, "1001"),
+              ("KOSDAQ 외국인·기관", client.foreign_institution_rank, "1001"),
+          )
+          warnings = []
+          for name, function, market_code in checks:
+              try:
+                  rows = function(market_code)
+                  print(f"{name}: {len(rows)}건")
+                  if not rows:
+                      warnings.append(f"{name} 결과 없음")
+              except Exception as exc:
+                  warnings.append(f"{name} 오류: {type(exc).__name__}")
+                  print(f"{name}: {type(exc).__name__} — {exc}")
+
+          ranking_status = "warning" if warnings else "success"
+          if warnings:
+              print("휴장일·장외 시간에는 정상일 수 있는 경고: " + "; ".join(warnings))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"ranking_status={ranking_status}\n")
+          PY
+
+      - name: Test morning briefing data sources
+        id: morning_data
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          from datetime import date, timedelta
+
+          import main
+
+          target = main.nearest_krx_business_day(date.today() - timedelta(days=1), previous=True)
+          themes = main.load_theme_map()
+          snapshots = main.fetch_us_snapshots(themes)
+          ranked = main.rank_us_themes(themes, snapshots)
+          listing_dates = main.fetch_listing_dates()
+          domestic = main.fetch_kr_market_top10(target, listing_dates)
+
+          if len(ranked) < 3 or len(domestic) < 10:
+              raise RuntimeError(
+                  f"브리핑 데이터 부족: 미국 테마 {len(ranked)}개, 국내 종목 {len(domestic)}개"
+              )
+          print(f"모닝 데이터 성공: 기준일 {target}, 미국 테마 {len(ranked)}개, 국내 종목 {len(domestic)}개")
+          PY
+
+      - name: Send test report to Telegram
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SECRETS_STATUS: ${{ steps.secrets_check.outcome }}
+          DEPENDENCIES_STATUS: ${{ steps.dependencies.outcome }}
+          UNIT_STATUS: ${{ steps.unit_tests.outcome }}
+          KIS_QUOTE_STATUS: ${{ steps.kis_test.outcome }}
+          KIS_RANK_STATUS: ${{ steps.kis_test.outputs.ranking_status }}
+          MORNING_STATUS: ${{ steps.morning_data.outcome }}
+        shell: bash
+        run: |
+          if [ "$JOB_STATUS" = "success" ] && [ "$KIS_RANK_STATUS" = "success" ] && [ "$MORNING_STATUS" = "success" ]; then
+            ICON="✅"
+          else
+            ICON="⚠️"
+          fi
+
+          MESSAGE=$(printf '%s 주식 알림 시스템 테스트\n\n필수 Secrets: %s\n패키지 설치: %s\n단위 테스트: %s\nKIS 인증·시세: %s\nKIS 순위 API: %s\n모닝 데이터: %s\n\n※ 순위 API는 휴장일·장외 시간에 결과가 비어 실패로 표시될 수 있습니다.' \
+            "$ICON" "$SECRETS_STATUS" "$DEPENDENCIES_STATUS" "$UNIT_STATUS" \
+            "$KIS_QUOTE_STATUS" "$KIS_RANK_STATUS" "$MORNING_STATUS")
+
+          curl -fsS -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
