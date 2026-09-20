@@ -1,0 +1,5 @@
+finance-datareader>=0.9.96,<1
+pandas>=2.2,<4
+pykrx>=1.2.9,<2
+requests>=2.32,<3
+yfinance>=0.2.54,<1
