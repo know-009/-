@@ -1,0 +1,25 @@
+name: Telegram Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  telegram-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Send Telegram test message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "TELEGRAM_BOT_TOKEN이 없습니다."; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo "TELEGRAM_CHAT_ID가 없습니다."; exit 1; }
+
+          curl -fsS -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=✅ 텔레그램 연결 테스트 성공! GitHub Actions 알림이 정상 작동합니다."
